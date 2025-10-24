@@ -1,0 +1,696 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>FocusFlight — Dial Time → Locations → Ticket → Flight</title>
+
+  <!-- Fonts & Tailwind -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" crossorigin href="https://fonts.gstatic.com">
+  <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+  <script>
+    tailwind.config = {
+      darkMode: "class",
+      theme: {
+        extend: {
+          colors: {
+            primary:"#137fec", background:"#0b1018", card:"#161d27",
+            header:"#2C5282", text:"#F5F7FA",
+            "background-light":"#f5f7f8","background-dark":"#101c22"
+          },
+          fontFamily:{ sans:["Roboto","sans-serif"], display:["Space Grotesk"] },
+          boxShadow:{ pass:"0 10px 25px rgba(0,0,0,.35)" },
+          borderRadius:{ DEFAULT:"0.5rem", lg:"1rem", xl:"1.5rem", full:"9999px" }
+        }
+      }
+    };
+  </script>
+
+  <!-- Leaflet / Turf -->
+  <link href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" rel="stylesheet">
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet-rotatedmarker/leaflet.rotatedMarker.js"></script>
+  <script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
+
+  <style>
+    /* Layer order */
+    #map { position: fixed; inset: 0; z-index: 0; }
+    #ff-ui { position: relative; z-index: 2000; }
+    #location-overlay { position: fixed; z-index: 2500; }
+    #boarding-pass-overlay { position: fixed; z-index: 3000; }
+    #arrived, .hud, .dock { position: fixed; z-index: 1500; }
+
+    html, body { height:100%; margin:0; background:#000; font-family:'Space Grotesk',sans-serif; overflow:hidden; }
+
+    .fade-in { animation: fadeIn 1s forwards; }
+    .fade-out { animation: fadeOut 1s forwards; }
+    @keyframes fadeIn { from { opacity: 0 } to { opacity: 1 } }
+    @keyframes fadeOut { from { opacity: 1 } to { opacity: 0 } }
+
+    .arrived {
+      position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+      background: radial-gradient(circle at 40% 30%, rgba(19,127,236,0.15), rgba(10,15,25,0.95));
+      color: #fff; text-align: center; transition: opacity 1s ease;
+    }
+    .arrived.hide { opacity: 0; pointer-events: none; }
+
+    .pulse-dot { width: 1rem; height: 1rem; background-color: #137fec; border-radius: 9999px;
+      box-shadow: 0 0 0 0 rgba(19,127,236,1); animation: pulse 2s infinite; margin-top: 1rem; }
+    @keyframes pulse {
+      0% { transform: scale(.95); box-shadow: 0 0 0 0 rgba(19,127,236,.7); }
+      70% { transform: scale(1); box-shadow: 0 0 0 20px rgba(19,127,236,0); }
+      100% { transform: scale(.95); box-shadow: 0 0 0 0 rgba(19,127,236,0); }
+    }
+
+    .hud {
+      top: 1rem; right: 1rem; background: rgba(15,20,30,.9);
+      color: #fff; padding: 1rem 1.2rem; border-radius: .8rem; box-shadow: 0 6px 18px rgba(0,0,0,.3);
+      min-width: 17rem; transition: opacity .3s;
+    }
+    .hud.hide { opacity: 0; pointer-events: none; }
+
+    .dock { bottom: 1rem; left: 50%; transform: translateX(-50%); display:flex; gap:.6rem; }
+    .dock button {
+      background: rgba(15,20,30,.85); color: #fff; border: none;
+      padding: .6rem 1rem; border-radius: 50px; cursor: pointer; font-weight: 600;
+      box-shadow: 0 6px 18px rgba(0,0,0,.3);
+    }
+
+    /* Boarding Pass */
+    .boarding-pass-main,.boarding-pass-stub{transition:transform .3s cubic-bezier(.68,-.55,.27,1.55);}
+    .perforated-edge::before{
+      content:'';position:absolute;top:0;bottom:0;left:-1px;width:2px;
+      background-image:linear-gradient(to bottom,#64748B 50%,transparent 50%);
+      background-size:2px 8px;
+    }
+
+    /* Dial */
+    .dial {
+      width: 280px; height: 280px; border-radius: 9999px;
+      background: radial-gradient(circle at 50% 45%, rgba(255,255,255,.12), rgba(255,255,255,.04));
+      box-shadow: inset 0 10px 30px rgba(0,0,0,.35), 0 8px 40px rgba(0,0,0,.35);
+      position: relative; user-select: none;
+    }
+    .dial .tick {
+      position: absolute; left: 50%; top: 50%;
+      width: 2px; height: 14px; background: rgba(255,255,255,.22);
+      transform-origin: bottom center;
+    }
+    .dial .needle {
+      position: absolute; left: 50%; top: 50%;
+      width: 4px; height: 110px; background: #137fec; border-radius: 4px;
+      transform-origin: bottom center; box-shadow: 0 0 18px rgba(19,127,236,.6);
+    }
+    .dial .center {
+      position: absolute; left: 50%; top: 50%; width: 18px; height: 18px;
+      background: #0b1018; border: 3px solid #137fec; border-radius: 9999px;
+      transform: translate(-50%,-50%);
+      box-shadow: 0 0 10px rgba(19,127,236,.6), inset 0 0 6px rgba(0,0,0,.6);
+    }
+  </style>
+</head>
+
+<body class="bg-background-dark font-display text-white">
+
+  <!-- ================== PAGE 1: TIME (Dial + ▲/▼ + inputs) ================== -->
+  <div id="ff-ui" class="relative min-h-screen w-full overflow-x-hidden bg-gradient-to-br from-background-dark/80 via-background-dark to-background-dark/90">
+    <div class="absolute inset-0 bg-[url('https://www.transparenttextures.com/patterns/carbon-fibre.png')] opacity-5"></div>
+    <div class="flex h-full min-h-screen flex-col">
+      <header class="flex items-center justify-between whitespace-nowrap border-b border-white/10 px-10 py-4 backdrop-blur-sm">
+        <div class="flex items-center gap-3">
+          <svg class="h-8 w-8 text-primary" fill="none" viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg"><path d="M13.8261 17.4264C16.7203 18.1174 20.2244 18.5217 24 18.5217C27.7756 18.5217 31.2797 18.1174 34.1739 17.4264C36.9144 16.7722 39.9967 15.2331 41.3563 14.1648L24.8486 40.6391C24.4571 41.267 23.5429 41.267 23.1514 40.6391L6.64374 14.1648C8.00331 15.2331 11.0856 16.7722 13.8261 17.4264Z" fill="currentColor"></path></svg>
+          <h1 class="text-xl font-bold">FocusFlight</h1>
+        </div>
+      </header>
+
+      <main class="flex flex-1 items-center justify-center p-8">
+        <div class="grid w-full max-w-6xl grid-cols-1 gap-10 lg:grid-cols-2">
+
+          <!-- Dial -->
+          <div class="relative flex flex-col items-center justify-center gap-4">
+            <div id="dial" class="dial">
+              <!-- ticks -->
+              <div id="dialTicks"></div>
+              <div id="dialNeedle" class="needle" style="transform: translate(-50%,-100%) rotate(200deg)"></div>
+              <div class="center"></div>
+            </div>
+            <div class="text-white/70 text-sm -mt-2">Drag the dial, scroll, or use ▲/▼</div>
+          </div>
+
+          <!-- Controls -->
+          <div class="flex flex-col justify-center gap-6 rounded-xl bg-white/5 p-8 dark:bg-white/10 backdrop-blur-lg border border-white/10">
+            <h2 class="text-3xl font-bold text-white">Set your focus duration</h2>
+
+            <div class="grid grid-cols-[auto_1fr_auto] items-center gap-3">
+              <button id="stepUp"  class="h-12 px-4 rounded-lg bg-white/10 hover:bg-white/20 text-xl">▲</button>
+
+              <div class="grid grid-cols-3 gap-3">
+                <div>
+                  <label class="text-xs text-white/60">Minutes</label>
+                  <input id="minInput" type="number" min="1" max="180" step="1" value="25"
+                         class="mt-1 h-12 w-full rounded-lg border border-white/10 bg-white/10 px-3 text-white text-xl focus:border-primary focus:outline-none"/>
+                </div>
+                <div>
+                  <label class="text-xs text-white/60">Seconds</label>
+                  <input id="secInput" type="number" min="0" max="59" step="1" value="0"
+                         class="mt-1 h-12 w-full rounded-lg border border-white/10 bg-white/10 px-3 text-white text-xl focus:border-primary focus:outline-none"/>
+                </div>
+                <div>
+                  <label class="text-xs text-white/60">Total</label>
+                  <input id="uiTime" readonly
+                         class="mt-1 h-12 w-full rounded-lg border border-white/10 bg-white/5 px-3 text-white text-xl"/>
+                </div>
+              </div>
+
+              <button id="stepDown" class="h-12 px-4 rounded-lg bg-white/10 hover:bg-white/20 text-xl">▼</button>
+            </div>
+
+            <div class="flex gap-2">
+              <button data-preset="15:00" class="px-3 h-10 rounded bg-white/10 hover:bg-white/20">15:00</button>
+              <button data-preset="25:00" class="px-3 h-10 rounded bg-white/10 hover:bg-white/20">25:00</button>
+              <button data-preset="45:00" class="px-3 h-10 rounded bg-white/10 hover:bg-white/20">45:00</button>
+              <button data-preset="1:00:00" class="px-3 h-10 rounded bg-white/10 hover:bg-white/20">1:00:00</button>
+            </div>
+
+            <button id="uiStart"
+                    class="mt-2 flex h-12 w-full items-center justify-center rounded-lg bg-primary text-base font-bold text-white shadow-lg shadow-primary/20 transition-all hover:bg-primary/90 hover:shadow-primary/40">
+              Continue → Locations
+            </button>
+          </div>
+        </div>
+      </main>
+    </div>
+  </div>
+
+  <!-- ================== PAGE 2: LOCATION OVERLAY ================== -->
+  <div id="location-overlay" class="hidden fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
+    <div class="w-full max-w-xl rounded-2xl bg-card border border-white/10 p-6">
+      <h3 class="text-2xl font-bold mb-4">Enter your route</h3>
+      <div class="grid gap-4">
+        <div>
+          <label class="text-sm text-white/70">From</label>
+          <input id="from" class="h-12 w-full rounded-lg border border-white/10 bg-white/10 px-4 text-white focus:border-primary focus:outline-none"
+                 placeholder="From (city or airport)" value="Dubai International Airport">
+        </div>
+        <div>
+          <label class="text-sm text-white/70">To</label>
+          <input id="to" class="h-12 w-full rounded-lg border border-white/10 bg-white/10 px-4 text-white focus:border-primary focus:outline-none"
+                 placeholder="To (city or airport)" value="Tokyo Haneda Airport">
+        </div>
+      </div>
+      <div class="mt-6 flex gap-3 justify-end">
+        <button id="locCancel" class="px-4 h-10 rounded-lg bg-white/10 hover:bg-white/20">Back</button>
+        <button id="locContinue" class="px-4 h-10 rounded-lg bg-primary hover:bg-primary/90 font-bold">Continue → Ticket</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ================== PAGE 3: BOARDING PASS (tear to start) ================== -->
+  <div id="boarding-pass-overlay" class="hidden fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center">
+    <div class="relative text-white font-sans flex items-center justify-center">
+      <div class="text-xs text-gray-400 absolute -bottom-10 w-full text-center font-display tracking-widest animate-pulse">
+        Drag the <b>right stub down</b> to board your flight
+      </div>
+
+      <div id="boarding-pass-container" class="relative w-[700px] h-[280px] cursor-grab active:cursor-grabbing select-none">
+        <!-- Main Pass -->
+        <div class="boarding-pass-main absolute left-0 top-0 w-[calc(100%-150px)] h-full bg-card rounded-xl shadow-pass text-text flex flex-col origin-right">
+          <div class="bg-header text-white px-4 py-3 rounded-t-xl flex justify-between items-center">
+            <h2 class="font-display font-bold text-lg tracking-wide">FOCUSFLIGHT</h2>
+            <span class="font-mono text-xs">BOARDING PASS</span>
+          </div>
+
+          <div class="px-6 py-4 flex-grow grid grid-cols-3 gap-x-4 items-center">
+            <div class="col-span-2 space-y-4">
+              <div class="grid grid-cols-2 gap-4">
+                <div>
+                  <p class="text-[10px] text-gray-400">FROM</p>
+                  <p id="bp-from" class="font-bold text-base leading-tight">—</p>
+                </div>
+                <div>
+                  <p class="text-[10px] text-gray-400">TO</p>
+                  <p id="bp-to" class="font-bold text-base leading-tight">—</p>
+                </div>
+              </div>
+
+              <div class="grid grid-cols-2 gap-4">
+                <div>
+                  <p class="text-[10px] text-gray-400">DURATION</p>
+                  <p id="bp-dur" class="font-mono font-bold text-sm text-primary">—</p>
+                </div>
+                <div>
+                  <p class="text-[10px] text-gray-400">DATE</p>
+                  <p id="bp-date" class="font-mono font-bold text-sm uppercase"></p>
+                </div>
+              </div>
+            </div>
+
+            <div class="col-span-1 flex justify-center items-center">
+              <svg class="w-14 h-14 text-primary opacity-80" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" stroke-linecap="round" stroke-linejoin="round" stroke-width="2"></path>
+              </svg>
+            </div>
+          </div>
+
+          <div class="px-4 py-2 border-t-2 border-dashed border-gray-500">
+            <img src="https://user-images.githubusercontent.com/1025588/31506377-88f45d4c-af77-11e7-9604-9d8035a56654.png"
+                 class="w-full h-8 object-cover opacity-80">
+          </div>
+        </div>
+
+        <!-- Stub -->
+        <div class="boarding-pass-stub absolute right-0 top-0 w-[150px] h-full bg-card rounded-xl shadow-pass text-white flex flex-col justify-between items-center p-3 origin-top perforated-edge">
+          <h3 class="font-display font-bold text-primary tracking-wider text-sm">FOCUS</h3>
+          <div class="text-center space-y-1">
+            <p class="text-[10px] text-gray-400">TICKET</p>
+            <p class="font-mono font-bold text-lg text-primary">FF-001</p>
+          </div>
+          <img src="https://user-images.githubusercontent.com/1025588/31506377-88f45d4c-af77-11e7-9604-9d8035a56654.png"
+               class="w-full h-16 object-cover transform rotate-90 opacity-80">
+          <p class="text-[10px] font-mono text-gray-500">FF-001</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ================== MAP + HUD + AUDIO ================== -->
+  <div id="map"></div>
+
+  <audio id="ambience" preload="auto">
+    <source src="airplane-interior-ambience-59644.mp3" type="audio/mpeg">
+    Your browser doesn’t support airplane ambience.
+  </audio>
+
+  <!-- ARRIVAL SCREEN -->
+  <div id="arrived" class="arrived hide">
+    <h1 style="font-size:4rem;letter-spacing:4px;margin-bottom:1rem;">ARRIVED</h1>
+    <p class="text-xl">at <span id="airport">Destination</span></p>
+    <div class="pulse-dot"></div>
+    <button id="restart" style="margin-top:2rem;background:#137fec;border:none;padding:.7rem 2rem;border-radius:50px;font-weight:700;color:#fff;cursor:pointer;">Start New Flight</button>
+  </div>
+
+  <!-- HUD -->
+  <div class="hud" id="hud">
+    <strong>FocusFlight HUD</strong><br>
+    Route: <span id="route">—</span><br>
+    ETA: <span id="eta">--</span> | Dist: <span id="dist">--</span> km<br>
+    Alt: <span id="alt">--</span> ft | Spd: <span id="spd">--</span> kts | Mode: <span id="mode">Follow</span>
+  </div>
+
+  <!-- Dock -->
+  <div class="dock">
+    <button id="theme">🌙 Theme</button>
+    <button id="hudToggle">🧭 HUD</button>
+    <button id="followToggle">🎯 Follow</button>
+  </div>
+
+<script>
+/* -------------------- Helpers -------------------- */
+const toRad = d => d * Math.PI / 180, toDeg = r => r * 180 / Math.PI;
+function fmtClock(ms){
+  const s = Math.max(0, Math.ceil(ms / 1000));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const ss = s % 60;
+  return h > 0
+    ? `${h}:${String(m).padStart(2,'0')}:${String(ss).padStart(2,'0')}`
+    : `${String(m).padStart(2,'0')}:${String(ss).padStart(2,'0')}`;
+}
+function parseTimeToMs(txt) {
+  const parts = txt.trim().split(':').map(Number);
+  if (parts.length === 2) { const [m,s]=parts; return ((m*60)+s)*1000; }
+  if (parts.length === 3) { const [h,m,s]=parts; return ((h*3600)+(m*60)+s)*1000; }
+  return 25*60*1000;
+}
+function clamp(n, min, max){ return Math.max(min, Math.min(max, n)); }
+
+// distance & course helpers for flight
+function haversine(a, b) {
+  const R = 6371e3, φ1 = toRad(a[0]), φ2 = toRad(b[0]);
+  const dφ = toRad(b[0] - a[0]), dλ = toRad(b[1] - a[1]);
+  const s = Math.sin(dφ/2)**2 + Math.cos(φ1)*Math.cos(φ2)*Math.sin(dλ/2)**2;
+  return R * 2 * Math.atan2(Math.sqrt(s), Math.sqrt(1 - s));
+}
+function bearing(a, b) {
+  const φ1 = toRad(a[0]), φ2 = toRad(b[0]), dλ = toRad(b[1] - a[1]);
+  const y = Math.sin(dλ) * Math.cos(φ2);
+  const x = Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(dλ);
+  return (toDeg(Math.atan2(y, x)) + 360) % 360;
+}
+function normalizeLon(l) { while (l > 180) l -= 360; while (l < -180) l += 360; return l; }
+function smoothAngle(s, e, step) { let d = (e - s + 540) % 360 - 180; return s + d * step; }
+
+/* -------------------- Map setup (Geoapify) -------------------- */
+let follow = true, plane, routeLine;  // globals
+
+const map = L.map('map', { zoomControl: false, inertia: true }).setView([25, 55], 3);
+
+const GEOAPIFY_KEY = "a52532e5c3314ab79426246d82cfe627";
+const geoapifyLight = L.tileLayer(
+  `https://maps.geoapify.com/v1/tile/positron/{z}/{x}/{y}.png?apiKey=${GEOAPIFY_KEY}`,
+  { maxZoom: 20, attribution: '© <a href="https://www.geoapify.com/" target="_blank">Geoapify</a>, © <a href="https://www.openstreetmap.org/copyright" target="_blank">OpenStreetMap</a> contributors' }
+);
+const geoapifyDark = L.tileLayer(
+  `https://maps.geoapify.com/v1/tile/dark-matter/{z}/{x}/{y}.png?apiKey=${GEOAPIFY_KEY}`,
+  { maxZoom: 20, attribution: '© <a href="https://www.geoapify.com/" target="_blank">Geoapify</a>, © <a href="https://www.openstreetmap.org/copyright" target="_blank">OpenStreetMap</a> contributors' }
+);
+let darkMode = window.matchMedia?.matches && window.matchMedia('(prefers-color-scheme: dark)').matches;
+let currentBase = darkMode ? geoapifyDark : geoapifyLight;
+currentBase.addTo(map);
+window.matchMedia('(prefers-color-scheme: dark)')?.addEventListener('change', e => {
+  map.removeLayer(currentBase);
+  darkMode = e.matches;
+  currentBase = darkMode ? geoapifyDark : geoapifyLight;
+  currentBase.addTo(map);
+});
+const planeIcon = L.icon({ iconUrl: 'https://cdn-icons-png.flaticon.com/512/2784/2784463.png', iconSize: [44, 44], iconAnchor: [22, 22] });
+
+/* -------------------- TIME UI (dial + inputs + ▲/▼) -------------------- */
+const ui = {
+  container: document.getElementById('ff-ui'),
+  time: document.getElementById('uiTime'),
+  minInput: document.getElementById('minInput'),
+  secInput: document.getElementById('secInput'),
+  start: document.getElementById('uiStart'),
+  stepUp: document.getElementById('stepUp'),
+  stepDown: document.getElementById('stepDown'),
+  dial: document.getElementById('dial'),
+  dialNeedle: document.getElementById('dialNeedle'),
+  dialTicks: document.getElementById('dialTicks'),
+};
+const DIAL_MIN = 1, DIAL_MAX = 180; // minutes range
+let currentFlight = { totalTime: 25*60*1000, minutes: 25, seconds: 0 };
+
+// build dial ticks every 5 minutes
+(function(){
+  for (let m = DIAL_MIN; m <= DIAL_MAX; m+=5){
+    const a = mapMinToAngle(m);
+    const el = document.createElement('div');
+    el.className = 'tick';
+    const len = (m % 15 === 0) ? 22 : 14;
+    el.style.height = len + 'px';
+    el.style.transform = `translate(-50%,-100%) rotate(${a}deg) translateY(-118px)`;
+    ui.dialTicks.appendChild(el);
+  }
+})();
+
+function minutesSecondsToMs(min, sec){ return (min*60 + sec) * 1000; }
+function msToMinutesSeconds(ms){
+  const s = Math.max(0, Math.round(ms/1000));
+  return { m: Math.floor(s/60), s: s%60 };
+}
+function updateTotalTimeFromInputs(){
+  const m = clamp(parseInt(ui.minInput.value||'0',10), DIAL_MIN, DIAL_MAX);
+  const s = clamp(parseInt(ui.secInput.value||'0',10), 0, 59);
+  ui.minInput.value = m; ui.secInput.value = s;
+  currentFlight.minutes = m; currentFlight.seconds = s;
+  currentFlight.totalTime = minutesSecondsToMs(m,s);
+  ui.time.value = fmtClock(currentFlight.totalTime);
+  setDialFromMinutes(m);
+}
+function setInputsFromMs(ms){
+  const {m,s} = msToMinutesSeconds(ms);
+  ui.minInput.value = clamp(m, DIAL_MIN, DIAL_MAX);
+  ui.secInput.value = clamp(s, 0, 59);
+  ui.time.value = fmtClock(ms);
+  setDialFromMinutes(ui.minInput.value);
+}
+function setDialFromMinutes(min){
+  const ang = mapMinToAngle(min);
+  ui.dialNeedle.style.transform = `translate(-50%,-100%) rotate(${ang}deg)`;
+}
+function mapMinToAngle(min){
+  const t = (min - DIAL_MIN) / (DIAL_MAX - DIAL_MIN);
+  return -140 + t * 280;
+}
+function mapAngleToMin(angle){
+  const a = clamp(angle, -140, 140);
+  const t = (a + 140) / 280;
+  const min = Math.round(DIAL_MIN + t * (DIAL_MAX - DIAL_MIN));
+  return clamp(min, DIAL_MIN, DIAL_MAX);
+}
+
+// Pointer / scroll interaction
+let dragging = false;
+ui.dial.addEventListener('pointerdown', e => { dragging = true; ui.dial.setPointerCapture(e.pointerId); handleDialPointer(e); });
+ui.dial.addEventListener('pointermove', e => { if (dragging) handleDialPointer(e); });
+ui.dial.addEventListener('pointerup',   e => { dragging = false; ui.dial.releasePointerCapture(e.pointerId); });
+ui.dial.addEventListener('wheel', e => {
+  e.preventDefault();
+  const delta = e.deltaY < 0 ? 1 : -1;
+  ui.minInput.value = clamp(parseInt(ui.minInput.value,10) + delta, DIAL_MIN, DIAL_MAX);
+  updateTotalTimeFromInputs();
+}, {passive:false});
+function handleDialPointer(e){
+  const rect = ui.dial.getBoundingClientRect();
+  const cx = rect.left + rect.width/2;
+  const cy = rect.top + rect.height/2;
+  const dx = e.clientX - cx;
+  const dy = e.clientY - cy;
+  let ang = Math.atan2(dy, dx) * 180/Math.PI + 90;
+  if (ang > 180) ang -= 360;
+  const min = mapAngleToMin(ang);
+  ui.minInput.value = min;
+  updateTotalTimeFromInputs();
+}
+
+// ▲ / ▼ buttons
+ui.stepUp.addEventListener('click', ()=>{ ui.minInput.value = clamp(parseInt(ui.minInput.value,10)+1, DIAL_MIN, DIAL_MAX); updateTotalTimeFromInputs(); });
+ui.stepDown.addEventListener('click', ()=>{ ui.minInput.value = clamp(parseInt(ui.minInput.value,10)-1, DIAL_MIN, DIAL_MAX); updateTotalTimeFromInputs(); });
+
+// direct input edits
+ui.minInput.addEventListener('change', updateTotalTimeFromInputs);
+ui.secInput.addEventListener('change', updateTotalTimeFromInputs);
+
+// presets
+document.querySelectorAll('[data-preset]').forEach(b=>b.addEventListener('click', ()=>{
+  const txt = b.getAttribute('data-preset');
+  const ms = parseTimeToMs(txt);
+  setInputsFromMs(ms);
+  currentFlight.totalTime = ms;
+}));
+
+// init
+setInputsFromMs(currentFlight.totalTime);
+
+/* -------------------- Page transitions -------------------- */
+const locationOverlay = document.getElementById('location-overlay');
+const locContinue = document.getElementById('locContinue');
+const locCancel = document.getElementById('locCancel');
+
+ui.start.addEventListener('click', () => {
+  ui.container.style.display = 'none';
+  locationOverlay.classList.remove('hidden');
+});
+locCancel.addEventListener('click', () => {
+  locationOverlay.classList.add('hidden');
+  ui.container.style.display = '';
+});
+
+/* -------------------- Boarding pass overlay -------------------- */
+const bpOverlay = document.getElementById('boarding-pass-overlay');
+const bpContainer = document.getElementById('boarding-pass-container');
+const bpMain = bpContainer.querySelector('.boarding-pass-main');
+const bpStub = bpContainer.querySelector('.boarding-pass-stub');
+const bpFrom = document.getElementById('bp-from');
+const bpTo = document.getElementById('bp-to');
+const bpDur = document.getElementById('bp-dur');
+const bpDate = document.getElementById('bp-date');
+(function setBPDate(){
+  const d = new Date();
+  bpDate.textContent = d.toLocaleString('default',{month:'short'}).toUpperCase() + ' ' + d.getDate();
+})();
+function showBoardingPass(origin, dest, durText){
+  bpFrom.textContent = origin || '—';
+  bpTo.textContent   = dest || '—';
+  bpDur.textContent  = durText || '—';
+  bpStub.style.transition = bpMain.style.transition = "none";
+  bpStub.style.transform = bpMain.style.transform = "translateY(0) rotate(0)";
+  bpStub.style.opacity = bpMain.style.opacity = "1";
+  void bpStub.offsetHeight;
+  bpStub.style.transition = bpMain.style.transition = "transform .6s ease, opacity .6s ease";
+  bpOverlay.classList.remove('hidden');
+}
+locContinue.addEventListener('click', () => {
+  const fromVal = document.getElementById('from').value || 'Origin';
+  const toVal   = document.getElementById('to').value || 'Destination';
+  locationOverlay.classList.add('hidden');
+  showBoardingPass(fromVal, toVal, fmtClock(currentFlight.totalTime));
+});
+
+// tear to start
+let isDragging=false,startY=0,offsetY=0;
+function getY(e){ return e.touches ? e.touches[0].clientY : e.clientY; }
+bpContainer.addEventListener("mousedown", startDrag);
+bpContainer.addEventListener("touchstart", startDrag);
+window.addEventListener("mousemove", drag);
+window.addEventListener("touchmove", drag);
+window.addEventListener("mouseup", endDrag);
+window.addEventListener("touchend", endDrag);
+function startDrag(e){
+  const tgt = e.target.closest('.boarding-pass-stub');
+  if(!tgt) return;
+  isDragging=true; startY=getY(e); offsetY=0;
+  bpStub.style.transition = "none"; bpMain.style.transition = "none";
+  bpContainer.style.cursor = "grabbing";
+}
+function drag(e){
+  if(!isDragging) return;
+  const currentY = getY(e);
+  offsetY = Math.max(0, currentY - startY);
+  const ratio = Math.min(1, offsetY / 300);
+  bpStub.style.transform = `translateY(${offsetY}px) rotate(${ratio*8}deg)`;
+  bpMain.style.transform = `translateY(${-ratio*15}px) rotate(${-ratio*3}deg)`;
+}
+function endDrag(){
+  if(!isDragging) return;
+  isDragging=false; bpContainer.style.cursor="grab";
+  bpStub.style.transition = bpMain.style.transition = "transform .6s ease, opacity .6s ease";
+  if(offsetY>150){
+    bpStub.style.transform="translateY(600px) rotate(25deg)";
+    bpMain.style.transform="translateY(-200px) rotate(-8deg)";
+    bpStub.style.opacity = bpMain.style.opacity = "0";
+    setTimeout(()=>{ bpOverlay.classList.add('hidden'); playLoopingSound(); startFlight(); }, 800);
+  } else {
+    bpStub.style.transform="translateY(0) rotate(0)";
+    bpMain.style.transform="translateY(0) rotate(0)";
+  }
+}
+
+/* -------------------- Ambience (cross-fade loop) -------------------- */
+const ambience = document.getElementById('ambience');
+let ambienceTimer;
+function fadeSound(audio, targetVol, duration) {
+  const step = 0.05; const dir = Math.sign(targetVol - audio.volume);
+  const iv = setInterval(() => {
+    audio.volume = Math.min(1, Math.max(0, audio.volume + dir * step));
+    if ((dir > 0 && audio.volume >= targetVol) || (dir < 0 && audio.volume <= targetVol)) clearInterval(iv);
+  }, duration * 1000 * step);
+}
+function scheduleCrossfadeFor(audio) {
+  const fallback = 142; // seconds
+  const dur = isFinite(audio.duration) && audio.duration > 0 ? audio.duration : fallback;
+  clearTimeout(ambienceTimer);
+  ambienceTimer = setTimeout(crossfadeAmbience, Math.max(2, dur - 2.5) * 1000);
+}
+function playLoopingSound() {
+  ambience.currentTime = 0; ambience.volume = 0;
+  ambience.play().catch(()=>{});
+  fadeSound(ambience, 0.6, 2.5);
+  if (isFinite(ambience.duration) && ambience.duration > 0) scheduleCrossfadeFor(ambience);
+  else ambience.addEventListener('loadedmetadata', ()=>scheduleCrossfadeFor(ambience), {once:true});
+}
+function crossfadeAmbience() {
+  const clone = ambience.cloneNode(true); clone.volume=0;
+  ambience.parentNode.appendChild(clone); clone.play().catch(()=>{});
+  fadeSound(ambience, 0, 2); fadeSound(clone, 0.6, 2);
+  setTimeout(()=>{ ambience.pause(); ambience.remove(); clone.id="ambience"; window.ambience = document.getElementById('ambience'); scheduleCrossfadeFor(ambience); }, 2200);
+}
+
+/* -------------------- Geocode + route -------------------- */
+async function geocode(q) {
+  const url = `https://api.geoapify.com/v1/geocode/search?text=${encodeURIComponent(q)}&apiKey=${GEOAPIFY_KEY}`;
+  const r = await fetch(url);
+  if (!r.ok) return [0,0,q];
+  const d = await r.json();
+  if (d && d.features && d.features[0]) {
+    const g = d.features[0].geometry.coordinates; // [lon,lat]
+    const name = d.features[0].properties.formatted || q;
+    return [g[1], g[0], name];
+  }
+  return [0,0,q];
+}
+function buildGreatCircle(A, B) {
+  const arc = turf.greatCircle(
+    turf.point([normalizeLon(A[1]), A[0]]),
+    turf.point([normalizeLon(B[1]), B[0]]),
+    { npoints: 800 }
+  );
+  return arc.geometry.coordinates.map(c => [c[1], normalizeLon(c[0])]);
+}
+
+/* -------------------- Flight logic (starts ONLY after ticket) -------------------- */
+let animFrameRef;
+async function startFlight(){
+  if (routeLine) map.removeLayer(routeLine);
+  if (plane) map.removeLayer(plane);
+  if (animFrameRef) cancelAnimationFrame(animFrameRef);
+
+  const from = document.getElementById('from').value;
+  const to   = document.getElementById('to').value;
+
+  const A = await geocode(from), B = await geocode(to);
+  if (!A[0] || !B[0]) { alert("Could not locate one of the airports."); return; }
+
+  const coords = buildGreatCircle(A, B);
+  if (coords.length < 2) { alert("Invalid route."); return; }
+
+  routeLine = L.polyline(coords, { color: '#137fec', weight: 4, smoothFactor: 1.5 }).addTo(map);
+  map.fitBounds(routeLine.getBounds(), { padding: [80, 80] });
+  plane = L.marker(A, { icon: planeIcon, rotationAngle: 0 }).addTo(map);
+
+  const segDists = [0]; for (let i = 1; i < coords.length; i++) segDists[i] = segDists[i - 1] + haversine(coords[i - 1], coords[i]);
+  const total = segDists[segDists.length - 1], start = performance.now();
+  let lastAngle = 0;
+
+  const totalTime = currentFlight.totalTime;
+
+  function step(now){
+    const elapsed = now - start;
+    const t = elapsed / totalTime;
+
+    if (t >= 1) { plane.setLatLng(coords.at(-1)); showArrival(B[2]); return; }
+
+    const targetDist = t * total;
+    let i = 1; while (i < segDists.length && segDists[i] < targetDist) i++;
+    const segFrac = (targetDist - segDists[i - 1]) / (segDists[i] - segDists[i - 1]);
+    const lat = coords[i - 1][0] + (coords[i][0] - coords[i - 1][0]) * segFrac;
+    const lon = coords[i - 1][1] + (coords[i][1] - coords[i - 1][1]) * segFrac;
+    const pos = [lat, lon];
+    const hdg = bearing(coords[i - 1], coords[i]);
+    const smoothH = smoothAngle(lastAngle, hdg, 0.2);
+    lastAngle = smoothH;
+
+    plane.setLatLng(pos); plane.setRotationAngle(smoothH);
+    if (follow) map.setView(pos, map.getZoom(), { animate: false });
+
+    document.getElementById('route').textContent = `${from} → ${to}`;
+    const remaining = Math.max(0, totalTime - elapsed);
+    document.getElementById('eta').textContent = fmtClock(remaining);
+    document.getElementById('dist').textContent = (total / 1000 * (1 - t)).toFixed(0);
+    document.getElementById('alt').textContent = (35000 * Math.sin(t * Math.PI)).toFixed(0);
+    document.getElementById('spd').textContent = (450 + 80 * Math.sin(t * Math.PI)).toFixed(0);
+
+    animFrameRef = requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+}
+
+function showArrival(name) {
+  fadeSound(ambience, 0, 2.5);
+  document.getElementById('arrived').classList.remove('hide');
+  document.getElementById('airport').textContent = name.split(',')[0];
+}
+
+/* -------------------- Small controls -------------------- */
+document.getElementById('restart').onclick = () => { if (!ambience.paused) { ambience.pause(); } window.location.reload(); };
+document.getElementById('theme').onclick = () => {
+  // toggle base layer + html dark class
+  map.removeLayer(currentBase);
+  darkMode = !darkMode;
+  currentBase = darkMode ? geoapifyDark : geoapifyLight;
+  currentBase.addTo(map);
+  document.documentElement.classList.toggle('dark', darkMode);
+};
+document.getElementById('hudToggle').onclick = () => document.getElementById('hud').classList.toggle('hide');
+document.getElementById('followToggle').onclick = () => { follow = !follow; document.getElementById('mode').textContent = follow ? 'Follow' : 'Free'; };
+</script>
+<div id="about" style="position:fixed;left:1rem;bottom:1rem;font-size:.8rem;color:#fff;opacity:.7;">
+  © <a href="https://www.geoapify.com/" target="_blank" style="color:#fff;text-decoration:underline;">Geoapify</a>, 
+  © <a href="https://www.openstreetmap.org/copyright" target="_blank" style="color:#fff;text-decoration:underline;">OpenStreetMap</a> contributors
+</div>
+
+</body>
+</html>
